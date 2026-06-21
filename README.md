@@ -4,7 +4,7 @@ I got the GNOME Web browser (WebKitGTK / Epiphany) to hardware-decode H.264 on a
 
 ## Why I did this
 
-Hardware video decode in a browser on the RK3588 has been a dead end for a while. The V4L2 path that mpv and GStreamer use is rejected upstream by Chromium, so it only survives in a downstream fork. Firefox has no working mainline-V4L2 path at all. There is no VA-API driver for the chip. Vulkan Video, meanwhile, is where the industry is heading. I wanted to find out whether a Vulkan Video driver could feed a real browser today, on this hardware.
+Hardware video decode in a browser on the RK3588 has been a dead end for a while. The V4L2 path that mpv and GStreamer use is rejected upstream by Chromium, so it only survives in a downstream fork. Firefox has no working mainline-V4L2 path at all. There is no VA-API driver for the chip. Vulkan Video, meanwhile, is the direction the desktop GPU stacks are taking, so it seemed like the thing to bet on. I wanted to find out whether a Vulkan Video driver could feed a real browser today, on this hardware.
 
 It can.
 
@@ -30,9 +30,65 @@ The Vulkan Video decoder, `vulkanh264dec`, hands frames out as `memory:VulkanIma
 
 So I wrote a tiny GStreamer bin, `vkh264bridge`, that wraps `vulkanh264dec ! vulkandownload` and presents itself to decodebin as an ordinary H.264 decoder with a plain `video/x-raw` NV12 output. decodebin then picks it like any other decoder, and the Vulkan context is shared internally between the two wrapped elements. That is the whole trick.
 
-## The prerequisite: the Vulkan Video V4L2 driver
+## Installing the Vulkan Video driver (the real prerequisite)
 
-This sits on top of the experimental V4L2-backed Vulkan Video ICD from Sreerenj Balachandran's RFC ([Mesa issue #14987](https://gitlab.freedesktop.org/mesa/mesa/-/issues/14987), commit `5955e6e`), plus a small init-sequence fix I found and reported back there ([note 3528237](https://gitlab.freedesktop.org/mesa/mesa/-/work_items/14987#note_3528237)). Without that fix the decode comes out blank on rkvdec. You need that ICD built and working first: it should enumerate as "V4L2 Vulkan Video Decoder" in `vulkaninfo`.
+Everything here rides on a Vulkan Video driver for the rkvdec hardware, and there is no packaged one yet. It is the experimental V4L2-backed Vulkan Video ICD from Sreerenj Balachandran's RFC ([Mesa issue #14987](https://gitlab.freedesktop.org/mesa/mesa/-/issues/14987), commit `5955e6e` on his `v4l2-vulkan-video` branch), plus a small init-sequence fix I found and reported there ([note 3528237](https://gitlab.freedesktop.org/mesa/mesa/-/work_items/14987#note_3528237)). Without that fix the hardware decodes a blank frame, so it is not optional.
+
+You build it from source. This is the path I used.
+
+Get Sreerenj's Mesa fork and check out the prototype:
+
+```sh
+git clone https://gitlab.freedesktop.org/sree/mesa.git
+cd mesa
+git checkout 5955e6eb0a03fdd0804b9b3ecf98d8681187c189   # the v4l2-vulkan-video branch
+```
+
+Apply the two patches from this repo's `icd/` directory:
+
+```sh
+git apply /path/to/icd/compat-mesa26.patch   # lets the ~3-month-old prototype build against Mesa 26.x
+git apply /path/to/icd/b0-fix.patch           # the init-SPS fix; without it the decode is blank
+```
+
+Build and install. The meson line is the prototype author's own (from its `ARCHITECTURE.txt`); change `platforms`, `gallium-drivers` and the prefix to suit your machine:
+
+```sh
+meson setup builddir -Dvulkan-drivers=v4l2-video -Dgallium-drivers=panfrost \
+  -Dvulkan-beta=true -Dplatforms=x11 -Dglx=dri -Degl=enabled -Dgbm=enabled \
+  -Dvideo-codecs=all --prefix=$HOME/mesa-v4l2-vulkan
+ninja -C builddir
+ninja -C builddir install
+```
+
+Point Vulkan at the driver and check it loaded:
+
+```sh
+export VK_ICD_FILENAMES=$HOME/mesa-v4l2-vulkan/share/vulkan/icd.d/v4l2vk_icd.aarch64.json
+vulkaninfo | grep -i v4l2   # the "V4L2 Vulkan Video Decoder" device should appear
+```
+
+`ninja install` writes both the library and the ICD manifest under your prefix; there is a copy of the manifest in `icd/` for reference. I built against Mesa 26.1-devel on aarch64 (Arch ARM). Once `vulkaninfo` lists the decoder, the bridge below can use it.
+
+## The fix I added (`icd/b0-fix.patch`)
+
+The prototype set the H.264 SPS control only on each decode request, never once at session init. The rkvdec stateless decoder wants the SPS as a plain non-request control before the CAPTURE format and buffers are set up. Without it the decoder stays unconfigured and writes a blank frame, even though the per-request controls are byte-identical to the in-tree `v4l2slh264dec` that decodes the same clip correctly. I found this by diffing the two drivers' `S_EXT_CTRLS` traces.
+
+So the fix sets the SPS non-request at init, right after `S_FMT(OUTPUT)` and before CAPTURE setup, and reads the driver's native CAPTURE format instead of forcing one:
+
+```c
+/* in session init, before set_capture_format(): */
+if (sps && pps) {
+    v4l2vk_h264_translate_sps_pps(sps, pps, &init_params);
+    v4l2vk_v4l2_set_init_sps(sess->v4l2_ctx, &init_params);   /* S_EXT_CTRLS, which = CUR_VAL */
+}
+
+/* inside v4l2vk_v4l2_set_init_sps(): */
+ext.which = V4L2_CTRL_WHICH_CUR_VAL;            /* non-request */
+xioctl(ctx->video_fd, VIDIOC_S_EXT_CTRLS, &ext);
+```
+
+The whole change is `icd/b0-fix.patch` (7 files). I reported it on [Mesa #14987](https://gitlab.freedesktop.org/mesa/mesa/-/work_items/14987#note_3528237). With it, the output is byte-exact against ffmpeg on baseline, High-with-B-frames, multi-slice, and cropped streams.
 
 ## Reproduce it
 
@@ -52,7 +108,7 @@ Point GStreamer at it and at the ICD. Nothing is installed system-wide:
 
 ```sh
 export GST_PLUGIN_PATH=$PWD:$GST_PLUGIN_PATH
-export VK_ICD_FILENAMES=/path/to/v4l2vk_icd.aarch64.json
+export VK_ICD_FILENAMES=$HOME/mesa-v4l2-vulkan/share/vulkan/icd.d/v4l2vk_icd.aarch64.json   # the one ninja install made, not the bundled icd/ copy
 rm -f ~/.cache/gstreamer-1.0/registry.aarch64.bin   # so the vulkan plugin re-registers with the ICD
 gst-inspect-1.0 vkh264bridge                          # should show rank 258
 ```
