@@ -1,0 +1,26 @@
+<!doctype html>
+<!-- Minimal page to test hardware H.264 decode in the browser.
+     Serve over http://localhost (WebKit cannot read file:// here) with a
+     206-capable server: `python3 range_server.py 8889 .`
+     A small generated H.264 test card (sample.mp4) ships next to this page;
+     replace it to test your own clip. -->
+<html>
+<head><meta charset="utf-8"><title>vkh264bridge test</title></head>
+<body style="margin:0;background:#111">
+  <video id="v" src="sample.mp4" poster="sample-poster.jpg" muted loop playsinline autoplay
+         style="width:100vw;height:88vh;object-fit:contain"></video>
+  <div id="s" style="position:fixed;top:0;left:0;color:#0f0;
+       font:22px monospace;background:#000;padding:4px">init</div>
+  <script>
+    const v = document.getElementById('v'), s = document.getElementById('s');
+    function show(tag) {
+      s.textContent = tag + '  readyState=' + v.readyState +
+        '  t=' + v.currentTime.toFixed(2) + '  ' + v.videoWidth + 'x' + v.videoHeight;
+    }
+    v.addEventListener('canplay', () => v.play());
+    v.addEventListener('playing', () => show('PLAYING'));
+    v.addEventListener('error', () => show('ERROR ' + (v.error && v.error.code)));
+    setInterval(() => show('tick'), 700);
+  </script>
+</body>
+</html>
