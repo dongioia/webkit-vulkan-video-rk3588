@@ -12,8 +12,8 @@ It can.
 
 This is a proof of concept, so I want to be precise about what I actually verified:
 
-- The decode is real hardware, and it is correct. The Vulkan Video driver runs H.264 on the RK3588's rkvdec block, and the first decoded frame matched an ffmpeg reference byte-for-byte.
-- It actually plays in a browser. Epiphany decodes and shows an H.264 clip through this path with rkvdec busy the whole time and no software fallback. The video keeps playing, not just a frozen first frame.
+- The decode is real hardware, and it is correct. The Vulkan Video driver runs H.264 on the RK3588's rkvdec block, and the decoded frames match an ffmpeg reference byte-for-byte at every resolution I tried, 360p through 1080p, cropped sizes included.
+- It actually plays in a browser. Epiphany decodes and plays an H.264 clip this way, including a real one I pulled off YouTube, with rkvdec busy the whole time and no software fallback. The video keeps playing, not just a frozen first frame.
 - Nothing in WebKit was patched. The only moving parts are an out-of-tree GStreamer plugin and two environment variables.
 
 The honest caveats:
@@ -21,7 +21,7 @@ The honest caveats:
 - H.264 only. VP9, HEVC and AV1 are not done.
 - I tested on one board: a Radxa Rock 5B+, kernel 7.1, Mesa 26.0.6, sway. I do not know how it behaves elsewhere, which is part of why I am publishing this.
 - The decode-to-display path copies through system memory. There is no zero-copy yet.
-- The byte-exact check is on the standalone decode. In-browser correctness is confirmed visually (a test pattern renders correctly), not byte-checked through the browser compositor.
+- The byte-exact check is on the standalone decode. In-browser correctness is confirmed visually (the picture is right), not byte-checked through the browser compositor.
 - The bridge element is a proof of concept, not production code.
 
 ## How it works
@@ -47,8 +47,9 @@ git checkout 5955e6eb0a03fdd0804b9b3ecf98d8681187c189   # the v4l2-vulkan-video 
 Apply the two patches from this repo's `icd/` directory:
 
 ```sh
-git apply /path/to/icd/compat-mesa26.patch   # lets the ~3-month-old prototype build against Mesa 26.x
-git apply /path/to/icd/b0-fix.patch           # the init-SPS fix; without it the decode is blank
+git apply /path/to/icd/compat-mesa26.patch       # lets the ~3-month-old prototype build against Mesa 26.x
+git apply /path/to/icd/b0-fix.patch              # the init-SPS fix; without it the decode is blank
+git apply /path/to/icd/s3-readback-stride.patch  # the row-stride fix; without it, non-720p frames tear
 ```
 
 Build and install. The meson line is the prototype author's own (from its `ARCHITECTURE.txt`); change `platforms`, `gallium-drivers` and the prefix to suit your machine:
@@ -89,6 +90,14 @@ xioctl(ctx->video_fd, VIDIOC_S_EXT_CTRLS, &ext);
 ```
 
 The whole change is `icd/b0-fix.patch` (7 files). I reported it on [Mesa #14987](https://gitlab.freedesktop.org/mesa/mesa/-/work_items/14987#note_3528237). With it, the output is byte-exact against ffmpeg on baseline, High-with-B-frames, multi-slice, and cropped streams.
+
+## A second fix: row stride (`icd/s3-readback-stride.patch`)
+
+After the first version went up, I tried a real clip at 360p and the picture fell apart: the frame tiled itself sideways with a green band along the bottom. Still real hardware decode, just the pixels in the wrong places.
+
+It was a row-stride mismatch in the readback. When the driver copies a decoded NV12 frame out of the Vulkan image into system memory, it took the row length as the width rounded up to 256. Everywhere else it uses the width rounded up to 16, which is the stride the kernel actually hands back: when it creates the image, when it copies the hardware buffer in, when it reports the layout. Those two only agree when the width is already a multiple of 256. 1280 is, so my first tests at 1280×720 came out byte-exact and the bug stayed hidden. 640 is not. The readback walked each row at a pitch of 768 while the data sat at 640, so every row slid 128 bytes and the image tore.
+
+The fix takes the stride from the image's own stored plane offset, so it matches the real layout at any width. With it the output is byte-exact at 360p, 720p and 1080p, cropped heights included, and that real YouTube clip plays cleanly in Epiphany. Like the init-SPS fix, it is small enough to belong upstream on the same Mesa #14987 thread.
 
 ## Reproduce it
 
