@@ -1,6 +1,6 @@
 # WebKit hardware video decode through Vulkan Video on the RK3588
 
-I got the GNOME Web browser (WebKitGTK / Epiphany) to hardware-decode H.264 on a Rockchip RK3588 board by routing it through a standalone Vulkan Video driver, with no patch to WebKit itself. This repository holds the small GStreamer bridge element that makes it work, plus what you need to reproduce it.
+I got the GNOME Web browser (WebKitGTK / Epiphany) to hardware-decode H.264, and now HEVC, on a Rockchip RK3588 board by routing it through a standalone Vulkan Video driver, with no patch to WebKit itself. This repository holds the small GStreamer bridge elements that make it work, plus what you need to reproduce it.
 
 ## Why I did this
 
@@ -10,25 +10,41 @@ It can.
 
 ## What works, and what doesn't
 
-This is a proof of concept, so I want to be precise about what I actually verified:
+This is a proof of concept, so I want to be precise about what I actually verified.
 
-- The decode is real hardware, and it is correct. The Vulkan Video driver runs H.264 on the RK3588's rkvdec block, and the decoded frames match an ffmpeg reference byte-for-byte at every resolution I tried, 360p through 1080p, cropped sizes included.
-- It actually plays in a browser. Epiphany decodes and plays an H.264 clip this way, including a real one I pulled off YouTube, with rkvdec busy the whole time and no software fallback. The video keeps playing, not just a frozen first frame.
+H.264, the original result:
+
+- Real hardware decode, byte-exact against an ffmpeg reference at 360p through 1080p, cropped sizes included.
+- Plays in Epiphany, including a clip pulled off YouTube, with rkvdec busy the whole time and no software fallback. The video keeps playing, not just a frozen first frame.
 - Nothing in WebKit was patched. The only moving parts are an out-of-tree GStreamer plugin and two environment variables.
 
-The honest caveats:
+HEVC, added afterwards:
 
-- H.264 only. VP9, HEVC and AV1 are not done.
+- Same idea, second codec. The driver decodes HEVC Main 8-bit on rkvdec, byte-exact against ffmpeg across a corpus I built to exercise the parser rather than just the geometry: 640×360 (cropped), 1280×720 and 1920×1080, each as I-only, P and B-frame variants, plus a longer-GOP clip with more than one short-term reference-picture set. Ten clips, all byte-exact.
+- It plays in Epiphany on both paths, a plain `<video>` tag and Media Source Extensions (what a streaming site uses): rkvdec busy, the bridge plugged, no software HEVC decoder, backward seek clean.
+- A clip I did not encode myself, Big Buck Bunny in HEVC from test-videos.co.uk (300 frames of I/P/B), decodes byte-exact and plays in the browser too.
+
+What the HEVC path does not cover, and I want to be exact about this:
+
+- Main profile, 8-bit, 4:2:0 only. No 10-bit, which means no Main10 and no HDR; a 10-bit stream will not use this path and falls back to software. No 4:2:2 or 4:4:4, no range extensions.
+- Weighted prediction is not parsed. A clip that uses it (some fades and dissolves do) may decode wrong.
+- Long-term references are not handled, and this one is a known bug, not just an untested case. The encoder I used (x265) does not emit long-term references, so I could not test them end to end; and the code that marks a decoded picture as a long-term reference still reads the H.264 side's flag, which is never set on the HEVC path. So a stream that uses long-term references may decode wrong. If you have one, I would like a copy.
+- YouTube, by the way, does not serve HEVC at all (it uses VP9, AV1 and H.264), so there is no YouTube-HEVC test to run here.
+
+The caveats that apply to both codecs:
+
 - I tested on one board: a Radxa Rock 5B+, kernel 7.1, Mesa 26.0.6, sway. I do not know how it behaves elsewhere, which is part of why I am publishing this.
-- The decode-to-display path copies through system memory. There is no zero-copy yet.
-- The byte-exact check is on the standalone decode. In-browser correctness is confirmed visually (the picture is right), not byte-checked through the browser compositor.
-- The bridge element is a proof of concept, not production code.
+- The decode-to-display path copies through system memory. There is no zero-copy yet (more on that below).
+- The byte-exact checks are on the standalone decode. In-browser correctness is confirmed visually (the picture is right), not byte-checked through the browser compositor.
+- The bridge elements are proof of concept, not production code.
 
 ## How it works
 
 The Vulkan Video decoder, `vulkanh264dec`, hands frames out as `memory:VulkanImage`. WebKit's GStreamer auto-plugger, `decodebin`, treats that opaque memory type as a dead end and will not insert a converter, so it falls back to software. The `vulkandownload` element can turn VulkanImage into plain system memory, but decodebin will not chain it in on its own.
 
 So I wrote a tiny GStreamer bin, `vkh264bridge`, that wraps `vulkanh264dec ! vulkandownload` and presents itself to decodebin as an ordinary H.264 decoder with a plain `video/x-raw` NV12 output. decodebin then picks it like any other decoder, and the Vulkan context is shared internally between the two wrapped elements. That is the whole trick.
+
+HEVC works the same way. `vkh265bridge` wraps `vulkanh265dec ! vulkandownload` with `video/x-h265` in and NV12 out. The only real difference is on the Media Source path: WebKit uses `decodebin3` there, which does not back out of a dead-end decoder the way `decodebin` does, so the bridge has to outrank the raw `vulkanh265dec` for `decodebin3` to pick it. Both bridges set rank 258 and demote the raw element, which covers both paths.
 
 ## Installing the Vulkan Video driver (the real prerequisite)
 
@@ -103,9 +119,10 @@ The fix takes the stride from the image's own stored plane offset, so it matches
 
 You will need:
 
-- An RK3588 board with a mainline kernel that exposes rkvdec (V4L2 stateless H.264).
+- An RK3588 board with a mainline kernel that exposes rkvdec (V4L2 stateless H.264 and HEVC).
 - GStreamer 1.28 or newer, with the `vulkan` and `v4l2codecs` plugins.
 - The Vulkan Video V4L2 ICD above, deployed and enumerating.
+- For HEVC, the ICD also needs the HEVC decode support I added on top of the same prototype. It is not in the upstream prototype yet, so I am offering it on the same Mesa #14987 thread; until it lands there the driver advertises H.264 only. Ask me if you want to try it before then.
 
 Build the bridge:
 
@@ -128,6 +145,13 @@ Quick decode check:
 gst-launch-1.0 filesrc location=sample.h264 ! h264parse ! vkh264bridge ! fakesink
 ```
 
+For HEVC, build `vkh265bridge` the same way (`make` builds both) and check it the same way, once the HEVC-capable ICD is in place:
+
+```sh
+gst-inspect-1.0 vkh265bridge                          # should also show rank 258
+gst-launch-1.0 filesrc location=sample.h265 ! h265parse ! vkh265bridge ! fakesink
+```
+
 In the browser:
 
 ```sh
@@ -143,7 +167,9 @@ I have run this on exactly one board. If you have an RK3588, or any SoC with a V
 
 ## Where this goes next
 
-H.264 is the start. The same bridge idea should extend to HEVC, VP9 and AV1 as the Vulkan Video drivers grow to cover them. Skipping the system-memory copy (zero-copy) and turning the bridge into a cleaner, upstreamable element are the obvious next steps.
+H.264 and HEVC work now. VP9 and AV1 are the next codecs, and they are harder: both are frame-based rather than slice-based, so the driver work is more than mirroring what HEVC needed. The long-term-reference gap in the HEVC path is the other thing I want to close, once I have a stream that actually uses them.
+
+The bigger item is dropping the system-memory copy. The decoded frame currently goes rkvdec to system RAM and back up to the GPU for display. A Mesa change that landed in June 2026 lets Panfrost's Vulkan driver sample an NV12 buffer with hardware YUV conversion, which is the piece that was missing for a zero-copy path on this hardware. I have not built on it yet, but it is the obvious direction, and it would want a newer system Mesa than the 26.0.6 I pinned for this. Turning the bridges into cleaner, upstreamable elements is the other open task.
 
 ## License
 
