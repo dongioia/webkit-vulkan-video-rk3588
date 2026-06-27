@@ -38,6 +38,10 @@ The caveats that apply to both codecs:
 - The byte-exact checks are on the standalone decode. In-browser correctness is confirmed visually (the picture is right), not byte-checked through the browser compositor.
 - The bridge elements are proof of concept, not production code.
 
+## A second path that is zero-copy, and covers all four codecs
+
+While chasing the system-memory copy above, I tried a different route into the same browser that does not go through Vulkan at all. It wraps the kernel's V4L2 stateless decoders directly and gets WebKit to take their hardware dmabuf with no copy, for H.264, HEVC, VP9 and AV1. It needs one small GStreamer element and no WebKit patch. The write-up, the honest caveats, and `gstv4l2metabridge.c` are in [v4l2-zerocopy.md](v4l2-zerocopy.md). The Vulkan path in the rest of this README is still the longer bet for upstream browsers; the V4L2 route is the thing that works in a browser today, zero-copy.
+
 ## How it works
 
 The Vulkan Video decoder, `vulkanh264dec`, hands frames out as `memory:VulkanImage`. WebKit's GStreamer auto-plugger, `decodebin`, treats that opaque memory type as a dead end and will not insert a converter, so it falls back to software. The `vulkandownload` element can turn VulkanImage into plain system memory, but decodebin will not chain it in on its own.
