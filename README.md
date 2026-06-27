@@ -169,6 +169,56 @@ epiphany http://localhost:8889/test/test.html
 
 A small generated H.264 test card ships at `test/sample.mp4`, and the page loads it by default, so you have something to play without hunting for a clip. Drop in your own file to test other streams. Watch `fuser /dev/video0` while it plays: it should stay busy. A note on the server: the stdlib `python3 -m http.server` answers byte-range requests with `200 OK` instead of `206 Partial Content`, and WebKit treats that as a network error and stalls. `range_server.py` answers ranges correctly.
 
+## Reproduce the V4L2 zero-copy path (all four codecs)
+
+This is the second path from the top of the README: no Vulkan, no ICD, zero-copy for H.264, HEVC, VP9 and AV1. The full write-up and the honest caveats are in [v4l2-zerocopy.md](v4l2-zerocopy.md); these are the steps end to end.
+
+You will need:
+
+- An RK3588 board whose kernel exposes the V4L2 stateless decoders: rkvdec for H.264/HEVC/VP9, and the Hantro AV1 block for AV1 (AV1 is not in every kernel build).
+- GStreamer with the `v4l2codecs` plugin, plus `gstreamer-video-1.0` to build the element.
+- WebKitGTK; I used 2.52 (Epiphany).
+
+First, give the kernel a bigger CMA pool, or sustained playback exhausts contiguous memory and locks the board up (zero-copy means the browser holds the hardware buffers). Add `cma=512M` to the kernel command line and reboot:
+
+```sh
+# e.g. append cma=512M to GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub, then:
+sudo grub-mkconfig -o /boot/grub/grub.cfg
+sudo reboot
+# after boot, confirm:
+grep CmaTotal /proc/meminfo          # should read ~524288 kB
+```
+
+Build the element (it needs gstreamer-video-1.0 for GstVideoMeta):
+
+```sh
+make libgstv4l2metabridge.so
+```
+
+Point GStreamer at it. There is no ICD and no `VK_ICD_FILENAMES` here; this path does not use Vulkan:
+
+```sh
+export GST_PLUGIN_PATH=$PWD:$GST_PLUGIN_PATH
+rm -f ~/.cache/gstreamer-1.0/registry.aarch64.bin
+gst-inspect-1.0 | grep metabridge    # v4l2{h264,h265,vp8,vp9,mpeg2,av1}metabridge, all rank 258
+```
+
+In the browser, same local server, no special flags:
+
+```sh
+python3 range_server.py 8889 .
+epiphany http://localhost:8889/test/test.html
+```
+
+While a video plays, watch which decode device is busy:
+
+```sh
+# rkvdec H.264/HEVC/VP9 -> /dev/video0 (or video1); Hantro AV1 -> /dev/video4
+for n in 0 1 4; do fuser /dev/video$n 2>/dev/null && echo "  ^ video$n busy"; done
+```
+
+A device staying busy with a clean picture is hardware zero-copy. On real youtube.com the same setup decodes AV1 and VP9 at 360p, 720p and 1080p; mind the rough edges (bottom band, 480p/240p black, MSE-teardown crash) documented in [v4l2-zerocopy.md](v4l2-zerocopy.md).
+
 ## Please test it
 
 I have run this on exactly one board. If you have an RK3588, or any SoC with a V4L2 stateless decoder and the Vulkan Video ICD, I would like to know whether it works for you. Open an issue with your board, your kernel, Mesa and GStreamer versions, and what happened. A report that it failed is as useful as a report that it worked.
