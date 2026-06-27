@@ -34,7 +34,7 @@ I tested in Epiphany (WebKitGTK 2.52) on a Radxa Rock 5B+, kernel 7.1, Mesa 26.0
 - AV1: hardware decode on the RK3588's separate AV1 block, a Hantro decoder on `/dev/video4` distinct from rkvdec, zero-copy, clean. This one needs a kernel that actually carries the AV1 stateless driver; it is not in every build.
 - VP9: hardware decode on rkvdec, zero-copy, clean, but only after forcing 8-bit NV12 output. Left to itself the decoder picks a 10-bit packed format (NV15) for an 8-bit clip, and WebKit's EGL cannot import NV15, so you get green tiles. The bridge pins NV12 for VP9 to avoid that.
 
-One thing applies to all of them: there is a thin band along the very bottom of the picture (green on VP9, shifting colour on AV1), the decoder's coded padding that the present path does not crop away. The decode is correct; the visible rectangle is not. Details in the YouTube section below.
+One thing had to be fixed for all of them: a band along the very bottom of the picture (green on VP9, shifting colour on AV1). The v4l2 decoders put the *coded* height in the buffer's GstVideoMeta (VP9 768 for a visible 720, H.264 1088 for 1080), and WebKit renders that height, so the padding rows below the picture get scanned out. Per the GstVideoMeta convention the height field is the display height and the padding lives in the plane offsets, which the decoder already sets correctly, so the bridge simply lowers the meta height to the visible height and WebKit crops the band. The dmabuf is untouched, so it stays zero-copy. AV1's band was a different thing, the tiled `NV12_4L4` output's edge tiles; forcing linear NV12 (below) plus the same crop clears it.
 
 Two details I had to get right beyond the meta injection, both for VP9 and AV1. First, frame alignment: these two stateless decoders only accept frame-aligned input, and without pinning `alignment=frame` the parser offers tu/obu/super-frame alignment, the decoder refuses the caps, and the browser quietly falls back to software. Pinning frame alignment is what got either codec onto the hardware at all. Second, the VP9 NV12 constraint above.
 
@@ -46,7 +46,7 @@ For comparison, the VP9 green here is not the one Chromium hit. Chromium's VP9 p
 - VP8 and MPEG-2: the element registers bridges for them too, because the rkvdec V4L2 driver exposes those decoders, but I have no test clips, so they are untested. Treat them as unproven.
 - VP9 logs a couple of non-fatal "device or resource busy" REQBUFS warnings at startup on the shared rkvdec device. The picture is still clean; I have not chased the warnings down.
 - AV1 logs a few "end picture error" warnings, three frames on a short clip. The picture is still clean, but I have not run them to ground.
-- Correctness in the browser is visual: the picture is right (apart from the bottom band below). It is not byte-checked through the compositor. The standalone decode is byte-exact against ffmpeg (the corpus in the main README, same kernel decoder).
+- Correctness in the browser is visual: the picture is right. It is not byte-checked through the compositor. The standalone decode is byte-exact against ffmpeg (the corpus in the main README, same kernel decoder).
 
 ## Real YouTube, tested by hand
 
@@ -57,11 +57,10 @@ The good part: on actual youtube.com, both AV1 and VP9 hardware-decode through t
 The rough edges, all of which live in the present path (WebKit's compositor and Mesa), not in the bridge or the decode:
 
 - You need a bigger CMA pool or it falls over. Zero-copy means the browser holds the actual hardware (CMA) buffers, and the decoder allocates more of them on the fly as the browser holds frames in flight. The default 64 MB CMA runs out within a minute or two of playback; the kernel then floods `cma: alloc failed` / `dma alloc of size … failed`, Mesa throws `drmPrimeHandleToFD() failed`, and the browser — or the whole board — locks up. Booting with `cma=512M` (kernel command line) makes the exhaustion and the freeze go away. This is a requirement, not a nice-to-have. See build notes below.
-- A band along the bottom of the video. Solid green on VP9, shifting colour on AV1. That is the decoder's coded-height padding (a few rows below the visible picture) being scanned out instead of cropped to the visible rectangle. It reproduces on a plain local clip too, so it is the present path not honoring the crop, not a YouTube quirk. The decode is right; the visible rectangle is not.
 - 480p and 240p go black, with a `MESA: error: WSI pitch not properly aligned` flood. Those resolutions are 854 and 426 wide, and a video whose width is not a multiple of 64 hits a pitch-alignment wall in the present path. 360p (640), 720p (1280) and 1080p (1920) are all 64-aligned and fine. Interestingly this one is H.264-specific in my tests; VP9 did not show it at any width.
 - Closing a tab can crash the browser (it restarts and reopens the tabs). On teardown Mesa logs `drmPrimeHandleToFD() failed (err=22)` and then a `g_close()` on a garbage fd with `EBADF`. This is a dmabuf-fd lifecycle bug on the MSE/teardown path; it does not happen on a plain local `<video>`, only with YouTube's Media Source path.
 
-So the honest one-liner: YouTube's AV1 and VP9 do hardware-decode here with `cma=512M`, but there is a cosmetic bottom band, 480p/240p are broken, and the MSE teardown is not stable. Usable to watch a 720p/1080p video, not production.
+So the honest one-liner: YouTube's AV1 and VP9 do hardware-decode here with `cma=512M`, the picture is clean, but 480p/240p are still broken and the MSE teardown is not stable. Usable to watch a 720p/1080p video, not production.
 
 ## How it relates to the Vulkan path
 

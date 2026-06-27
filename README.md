@@ -42,7 +42,7 @@ The caveats that apply to both codecs:
 
 While chasing the system-memory copy above, I tried a different route into the same browser that does not go through Vulkan at all. It wraps the kernel's V4L2 stateless decoders directly and gets WebKit to take their hardware dmabuf with no copy, for H.264, HEVC, VP9 and AV1. It needs one small GStreamer element and no WebKit patch. On real youtube.com, AV1 and VP9 hardware-decode this way at 360p, 720p and 1080p with zero dropped frames.
 
-It is not finished, and the rough edges are honest and specific: it needs a larger CMA pool (`cma=512M`) or sustained playback exhausts memory and locks up; there is a colour band along the bottom of the picture (coded padding the present path does not crop); 480p and 240p go black on a pitch-alignment wall; and closing a YouTube tab can crash the browser on the Media Source teardown. All of those live in WebKit and Mesa's present path, not in the decode. The write-up, the full caveats, the `cma=512M` requirement, and `gstv4l2metabridge.c` are in [v4l2-zerocopy.md](v4l2-zerocopy.md).
+It is not finished, and the rough edges are honest and specific: it needs a larger CMA pool (`cma=512M`) or sustained playback exhausts memory and locks up; 480p and 240p go black on a pitch-alignment wall; and closing a YouTube tab can crash the browser on the Media Source teardown. (An earlier colour band along the bottom of the picture, the decoder's coded padding, is fixed in the bridge.) The remaining rough edges live in WebKit and Mesa's present path, not in the decode. The write-up, the full caveats, the `cma=512M` requirement, and `gstv4l2metabridge.c` are in [v4l2-zerocopy.md](v4l2-zerocopy.md).
 
 The Vulkan path in the rest of this README is still the longer bet for upstream browsers. The V4L2 route is what decodes every codec the chip handles in a browser today; the present-path rough edges above are the work between here and something you would call finished.
 
@@ -217,7 +217,7 @@ While a video plays, watch which decode device is busy:
 for n in 0 1 4; do fuser /dev/video$n 2>/dev/null && echo "  ^ video$n busy"; done
 ```
 
-A device staying busy with a clean picture is hardware zero-copy. On real youtube.com the same setup decodes AV1 and VP9 at 360p, 720p and 1080p; mind the rough edges (bottom band, 480p/240p black, MSE-teardown crash) documented in [v4l2-zerocopy.md](v4l2-zerocopy.md).
+A device staying busy with a clean picture is hardware zero-copy. On real youtube.com the same setup decodes AV1 and VP9 at 360p, 720p and 1080p; mind the rough edges (480p/240p black, MSE-teardown crash) documented in [v4l2-zerocopy.md](v4l2-zerocopy.md).
 
 ## Please test it
 
